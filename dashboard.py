@@ -32,6 +32,7 @@ PROJECT_ROOT = Path(__file__).parent
 MODELS_DIR = PROJECT_ROOT / "models" / "intraday"
 POSITIONS_FILE = PROJECT_ROOT / "data" / "current_positions.csv"
 PORTFOLIO_FILE = PROJECT_ROOT / "data" / "portfolio_state.csv"
+TRADE_HISTORY_FILE = PROJECT_ROOT / "data" / "trade_history.csv"
 
 # Trading universe
 TRADING_STOCKS = ['GOOG', 'XOM', 'NVDA', 'CAT']
@@ -227,6 +228,51 @@ def save_positions(positions_df):
     positions_df.to_csv(POSITIONS_FILE, index=False)
 
 
+def load_trade_history():
+    """Load trade history"""
+    if not TRADE_HISTORY_FILE.exists():
+        df = pd.DataFrame(columns=[
+            'ticker', 'entry_price', 'exit_price', 'pnl', 'pnl_pct',
+            'entry_time', 'exit_time', 'hold_duration'
+        ])
+        df.to_csv(TRADE_HISTORY_FILE, index=False)
+        return df
+    return pd.read_csv(TRADE_HISTORY_FILE)
+
+
+def log_trade(ticker, entry_price, entry_time, exit_price):
+    """Log completed trade to history"""
+    history = load_trade_history()
+
+    # Calculate metrics
+    pnl = exit_price - entry_price
+    pnl_pct = (pnl / entry_price) * 100
+    exit_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    # Calculate hold duration
+    try:
+        entry_dt = pd.to_datetime(entry_time)
+        exit_dt = pd.to_datetime(exit_time)
+        hold_duration = str(exit_dt - entry_dt)
+    except:
+        hold_duration = 'N/A'
+
+    # Add new trade
+    new_trade = pd.DataFrame([{
+        'ticker': ticker,
+        'entry_price': entry_price,
+        'exit_price': exit_price,
+        'pnl': pnl,
+        'pnl_pct': pnl_pct,
+        'entry_time': entry_time,
+        'exit_time': exit_time,
+        'hold_duration': hold_duration
+    }])
+
+    history = pd.concat([history, new_trade], ignore_index=True)
+    history.to_csv(TRADE_HISTORY_FILE, index=False)
+
+
 def generate_signal(ticker):
     """Generate signal for ticker"""
     df = fetch_live_data(ticker)
@@ -280,15 +326,26 @@ def enter_position(ticker, price):
     st.rerun()
 
 
-def exit_position(ticker):
-    """Exit position (update CSV)"""
+def exit_position(ticker, exit_price):
+    """Exit position (update CSV and log trade)"""
     positions = load_positions()
     idx = positions[positions['ticker'] == ticker].index[0]
+
+    # Get position details before clearing
+    entry_price = float(positions.at[idx, 'entry_price'])
+    entry_time = positions.at[idx, 'entry_time']
+
+    # Log trade to history
+    log_trade(ticker, entry_price, entry_time, exit_price)
+
+    # Clear position
     positions.at[idx, 'has_position'] = False
     positions.at[idx, 'entry_price'] = 0.0
     positions.at[idx, 'entry_time'] = ''
     save_positions(positions)
-    st.success(f"✅ Exited {ticker} position")
+
+    pnl = exit_price - entry_price
+    st.success(f"✅ Exited {ticker} position | P&L: ${pnl:.2f}")
     st.rerun()
 
 
@@ -365,31 +422,8 @@ def create_price_chart(df, ticker):
     return fig
 
 
-def main():
-    """Main dashboard"""
-
-    # Header
-    st.markdown('<h1 class="main-header">📈 PHASE 9 TRADING DASHBOARD</h1>', unsafe_allow_html=True)
-
-    # Sidebar
-    with st.sidebar:
-        st.header("⚙️ Controls")
-        st.write("**Live Trading System**")
-        st.write("Phase 9 Smart Execution")
-        st.divider()
-
-        if st.button("🔄 Refresh Signals", use_container_width=True):
-            st.cache_data.clear()
-            st.rerun()
-
-        st.divider()
-        st.write("**System Stats**")
-        st.metric("Win Rate", "58.95%")
-        st.metric("Sharpe Ratio", "4.64")
-        st.metric("Backtest Return", "+3.54%")
-
-    # Load positions
-    positions = load_positions()
+def render_live_trading_tab(positions):
+    """Render Live Trading tab content"""
 
     # Portfolio Summary
     st.header("💼 Portfolio Overview")
@@ -505,7 +539,7 @@ def main():
                 else:
                     if st.button(f"📉 EXIT POSITION", key=f"exit_{ticker}",
                                 use_container_width=True, type="primary"):
-                        exit_position(ticker)
+                        exit_position(ticker, signal['price'])
 
                 # Show chart button
                 if st.button(f"📊 View Chart", key=f"chart_{ticker}",
@@ -524,7 +558,122 @@ def main():
 
             st.divider()
 
+
+def render_analytics_tab():
+    """Render Analytics tab with performance metrics"""
+    st.header("📊 Performance Analytics")
+
+    # Load trade history
+    history = load_trade_history()
+
+    if history.empty:
+        st.info("📭 No trades yet. Start trading to see analytics!")
+        return
+
+    # KPI Cards
+    st.subheader("📈 Key Performance Indicators")
+    col1, col2, col3, col4 = st.columns(4)
+
+    total_trades = len(history)
+    total_pnl = history['pnl'].sum()
+    winning_trades = len(history[history['pnl'] > 0])
+    win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+
+    with col1:
+        st.metric("Total Trades", total_trades)
+    with col2:
+        pnl_color = "normal" if total_pnl >= 0 else "inverse"
+        st.metric("Total P&L", f"${total_pnl:.2f}",
+                 delta=f"{total_pnl/2500*100:.2f}%" if total_trades > 0 else None)
+    with col3:
+        st.metric("Win Rate", f"{win_rate:.1f}%")
+    with col4:
+        avg_pnl = history['pnl'].mean()
+        st.metric("Avg P&L per Trade", f"${avg_pnl:.2f}")
+
+    st.divider()
+
+    # Equity Curve
+    st.subheader("💰 Equity Curve")
+
+    # Calculate cumulative P&L
+    history_sorted = history.sort_values('exit_time')
+    history_sorted['cumulative_pnl'] = history_sorted['pnl'].cumsum()
+
+    # Create line chart
+    st.line_chart(history_sorted.set_index('exit_time')['cumulative_pnl'])
+
+    st.divider()
+
+    # Trade History Table
+    st.subheader("📋 Recent Trades")
+
+    # Format display dataframe
+    display_df = history[['ticker', 'entry_price', 'exit_price', 'pnl', 'pnl_pct',
+                          'entry_time', 'exit_time', 'hold_duration']].copy()
+
+    # Format numeric columns
+    display_df['entry_price'] = display_df['entry_price'].apply(lambda x: f"${x:.2f}")
+    display_df['exit_price'] = display_df['exit_price'].apply(lambda x: f"${x:.2f}")
+    display_df['pnl'] = display_df['pnl'].apply(lambda x: f"${x:.2f}")
+    display_df['pnl_pct'] = display_df['pnl_pct'].apply(lambda x: f"{x:+.2f}%")
+
+    # Rename columns for display
+    display_df.columns = ['Ticker', 'Entry Price', 'Exit Price', 'P&L ($)',
+                          'P&L (%)', 'Entry Time', 'Exit Time', 'Duration']
+
+    # Show most recent first
+    st.dataframe(display_df.iloc[::-1], use_container_width=True, hide_index=True)
+
+    # Per-ticker breakdown
+    st.divider()
+    st.subheader("🎯 Per-Ticker Performance")
+
+    ticker_stats = history.groupby('ticker').agg({
+        'pnl': ['sum', 'mean', 'count']
+    }).round(2)
+
+    ticker_stats.columns = ['Total P&L', 'Avg P&L', 'Trades']
+    st.dataframe(ticker_stats, use_container_width=True)
+
+
+def main():
+    """Main dashboard with tabs"""
+
+    # Header
+    st.markdown('<h1 class="main-header">📈 PHASE 9 TRADING DASHBOARD</h1>', unsafe_allow_html=True)
+
+    # Sidebar
+    with st.sidebar:
+        st.header("⚙️ Controls")
+        st.write("**Live Trading System**")
+        st.write("Phase 9 Smart Execution")
+        st.divider()
+
+        if st.button("🔄 Refresh Signals", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+
+        st.divider()
+        st.write("**System Stats**")
+        st.metric("Win Rate", "58.95%")
+        st.metric("Sharpe Ratio", "4.64")
+        st.metric("Backtest Return", "+3.54%")
+
+    # Load positions
+    positions = load_positions()
+
+    # Create tabs
+    tab1, tab2 = st.tabs(["📉 Live Trading", "📊 Analytics"])
+
+    with tab1:
+        render_live_trading_tab(positions)
+
+    with tab2:
+        render_analytics_tab()
+
     # Footer
+    st.divider()
     st.caption("⚠️ **Risk Warning:** Past performance does not guarantee future results. "
               "This is for educational purposes. Trade at your own risk.")
     st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
