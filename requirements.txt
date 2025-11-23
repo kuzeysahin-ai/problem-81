@@ -1,0 +1,25 @@
+# PHASE 12: CLOUD DEPLOYMENT - REQUIREMENTS
+# ============================================
+# Production-ready dependencies for Streamlit Cloud
+
+# Core Data Science
+numpy>=1.24.0,<2.0.0
+pandas>=2.0.0,<3.0.0
+scikit-learn>=1.3.0,<2.0.0
+
+# Machine Learning
+xgboost>=2.0.0,<3.0.0
+
+# Market Data
+yfinance>=0.2.28
+
+# Visualization
+plotly>=5.18.0
+matplotlib>=3.7.0
+
+# Web Framework
+streamlit>=1.28.0
+
+# Utilities
+python-dateutil>=2.8.0
+pytz>=2023.3

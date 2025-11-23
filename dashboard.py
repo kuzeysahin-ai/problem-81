@@ -1,0 +1,534 @@
+"""
+PHASE 11: PROFESSIONAL TRADING DASHBOARD
+========================================
+
+Web-based Trading Control Panel with Streamlit
+
+Features:
+    - Live market signals with real-time updates
+    - One-click position management (no manual CSV editing!)
+    - Portfolio P&L tracking
+    - Interactive price charts
+    - Dark mode professional UI
+
+Usage:
+    streamlit run dashboard.py
+
+Then open: http://localhost:8501
+"""
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import pickle
+from datetime import datetime, timedelta
+import yfinance as yf
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+# Configuration
+PROJECT_ROOT = Path(__file__).parent
+MODELS_DIR = PROJECT_ROOT / "models" / "intraday"
+POSITIONS_FILE = PROJECT_ROOT / "data" / "current_positions.csv"
+PORTFOLIO_FILE = PROJECT_ROOT / "data" / "portfolio_state.csv"
+
+# Trading universe
+TRADING_STOCKS = ['GOOG', 'XOM', 'NVDA', 'CAT']
+
+# Constants
+MIN_ATR_THRESHOLD = 0.002
+ATR_PERIOD = 14
+EXCLUDE_COLS = [
+    'target_1h_return', 'target_class',
+    'open', 'high', 'low', 'close', 'volume',
+    'dividends', 'stock_splits',
+    'hour', 'minute', 'day_of_week',
+    'return', 'log_return', 'prev_close', 'tr'
+]
+
+# Page config
+st.set_page_config(
+    page_title="Trading Dashboard - Phase 9",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS for dark mode and styling
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 3rem;
+        font-weight: bold;
+        color: #00ff00;
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+    .metric-card {
+        background-color: #1e1e1e;
+        padding: 1.5rem;
+        border-radius: 10px;
+        border: 2px solid #333;
+        margin: 0.5rem 0;
+    }
+    .buy-signal {
+        background-color: #0d4d0d;
+        border-left: 5px solid #00ff00;
+    }
+    .sell-signal {
+        background-color: #4d0d0d;
+        border-left: 5px solid #ff0000;
+    }
+    .wait-signal {
+        background-color: #4d4d0d;
+        border-left: 5px solid #ffaa00;
+    }
+    .profit-positive {
+        color: #00ff00;
+        font-weight: bold;
+        font-size: 1.5rem;
+    }
+    .profit-negative {
+        color: #ff0000;
+        font-weight: bold;
+        font-size: 1.5rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+@st.cache_data(ttl=300)  # Cache for 5 minutes
+def calculate_vwap(df):
+    """Calculate VWAP"""
+    df['vwap'] = (df['close'] * df['volume']).cumsum() / df['volume'].cumsum()
+    df['vwap_distance'] = (df['close'] - df['vwap']) / df['vwap']
+    return df
+
+
+@st.cache_data(ttl=300)
+def add_intraday_features(df):
+    """Add all intraday features"""
+    df['return'] = df['close'].pct_change()
+    df['log_return'] = np.log(df['close'] / df['close'].shift(1))
+    df = calculate_vwap(df)
+    df['momentum_3h'] = df['return'].rolling(3).sum()
+    df['momentum_5h'] = df['return'].rolling(5).sum()
+
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI_14'] = 100 - (100 / (1 + rs))
+
+    df['bb_mid'] = df['close'].rolling(20).mean()
+    df['bb_std'] = df['close'].rolling(20).std()
+    df['bb_upper'] = df['bb_mid'] + (2 * df['bb_std'])
+    df['bb_lower'] = df['bb_mid'] - (2 * df['bb_std'])
+    df['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'] + 1e-6)
+
+    df['MA5'] = df['close'].rolling(5).mean()
+    df['MA10'] = df['close'].rolling(10).mean()
+    df['MA20'] = df['close'].rolling(20).mean()
+    df['ma_gap_5_20'] = (df['MA5'] - df['MA20']) / df['MA20']
+
+    df['volume_ma10'] = df['volume'].rolling(10).mean()
+    df['volume_ratio'] = df['volume'] / (df['volume_ma10'] + 1e-6)
+
+    df['high_low_range'] = (df['high'] - df['low']) / df['close']
+    df['close_open_range'] = (df['close'] - df['open']) / df['open']
+
+    df['hour'] = df.index.hour
+    df['minute'] = df.index.minute
+    df['is_opening'] = ((df['hour'] == 9) & (df['minute'] >= 30)).astype(int)
+    df['is_morning'] = ((df['hour'] >= 10) & (df['hour'] < 12)).astype(int)
+    df['is_lunch'] = ((df['hour'] >= 12) & (df['hour'] < 14)).astype(int)
+    df['is_afternoon'] = ((df['hour'] >= 14) & (df['hour'] < 15)).astype(int)
+    df['is_closing'] = (df['hour'] >= 15).astype(int)
+
+    df['day_of_week'] = df.index.dayofweek
+    df['is_monday'] = (df['day_of_week'] == 0).astype(int)
+    df['is_friday'] = (df['day_of_week'] == 4).astype(int)
+
+    df['return_lag1'] = df['return'].shift(1)
+    df['return_lag2'] = df['return'].shift(2)
+    df['volume_lag1'] = df['volume'].shift(1)
+
+    df['prev_close'] = df['close'].shift(1)
+    df['tr'] = df[['high', 'low', 'prev_close']].apply(
+        lambda x: max(x['high'] - x['low'],
+                     abs(x['high'] - x['prev_close']),
+                     abs(x['low'] - x['prev_close'])) if pd.notna(x['prev_close']) else x['high'] - x['low'],
+        axis=1
+    )
+    df['ATR'] = df['tr'].rolling(ATR_PERIOD).mean()
+    df['ATR_pct'] = df['ATR'] / df['close']
+
+    return df
+
+
+@st.cache_data(ttl=300)
+def fetch_live_data(ticker, period='60d', interval='1h'):
+    """Fetch live data"""
+    try:
+        stock = yf.Ticker(ticker)
+        df = stock.history(period=period, interval=interval)
+        if df.empty:
+            return None
+        df.columns = df.columns.str.lower().str.replace(' ', '_')
+        df.index = pd.to_datetime(df.index)
+        df = add_intraday_features(df)
+        df = df.dropna()
+        return df
+    except Exception as e:
+        st.error(f"Error fetching {ticker}: {e}")
+        return None
+
+
+@st.cache_resource
+def load_model(ticker):
+    """Load model"""
+    model_path = MODELS_DIR / f"xgb_intraday_{ticker}.pkl"
+    if not model_path.exists():
+        return None
+    with open(model_path, 'rb') as f:
+        return pickle.load(f)
+
+
+def prepare_features(df, model):
+    """Prepare features"""
+    feature_cols = [col for col in df.columns if col not in EXCLUDE_COLS]
+    X = df[feature_cols].copy()
+    X = X.fillna(0).replace([np.inf, -np.inf], 0)
+    if hasattr(model, 'get_booster'):
+        feature_names = model.get_booster().feature_names
+        if feature_names:
+            for feat in feature_names:
+                if feat not in X.columns:
+                    X[feat] = 0
+            X = X[feature_names]
+    return X
+
+
+def load_positions():
+    """Load current positions"""
+    if not POSITIONS_FILE.exists():
+        df = pd.DataFrame([
+            {'ticker': t, 'has_position': False, 'entry_price': 0.0, 'entry_time': ''}
+            for t in TRADING_STOCKS
+        ])
+        df.to_csv(POSITIONS_FILE, index=False)
+        return df
+    return pd.read_csv(POSITIONS_FILE)
+
+
+def save_positions(positions_df):
+    """Save positions"""
+    positions_df.to_csv(POSITIONS_FILE, index=False)
+
+
+def generate_signal(ticker):
+    """Generate signal for ticker"""
+    df = fetch_live_data(ticker)
+    if df is None or len(df) < 50:
+        return None
+
+    model = load_model(ticker)
+    if model is None:
+        return None
+
+    latest = df.iloc[-1]
+    current_price = latest['close']
+    atr_pct = latest['ATR_pct']
+
+    X = prepare_features(df.tail(1), model)
+    prediction = model.predict(X)[0]
+    confidence = model.predict_proba(X)[0, 1]
+
+    signal_text = 'BULLISH' if prediction == 1 else 'BEARISH'
+    volatility_ok = atr_pct >= MIN_ATR_THRESHOLD
+
+    if prediction == 1 and volatility_ok:
+        action = 'BUY'
+    elif prediction == 1 and not volatility_ok:
+        action = 'WAIT'
+    else:
+        action = 'SELL'
+
+    return {
+        'ticker': ticker,
+        'price': current_price,
+        'signal': signal_text,
+        'confidence': confidence,
+        'volatility_ok': volatility_ok,
+        'atr_pct': atr_pct,
+        'action': action,
+        'last_update': df.index[-1],
+        'df': df  # For charting
+    }
+
+
+def enter_position(ticker, price):
+    """Enter position (update CSV)"""
+    positions = load_positions()
+    idx = positions[positions['ticker'] == ticker].index[0]
+    positions.at[idx, 'has_position'] = True
+    positions.at[idx, 'entry_price'] = price
+    positions.at[idx, 'entry_time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    save_positions(positions)
+    st.success(f"✅ Entered {ticker} position at ${price:.2f}")
+    st.rerun()
+
+
+def exit_position(ticker):
+    """Exit position (update CSV)"""
+    positions = load_positions()
+    idx = positions[positions['ticker'] == ticker].index[0]
+    positions.at[idx, 'has_position'] = False
+    positions.at[idx, 'entry_price'] = 0.0
+    positions.at[idx, 'entry_time'] = ''
+    save_positions(positions)
+    st.success(f"✅ Exited {ticker} position")
+    st.rerun()
+
+
+def create_price_chart(df, ticker):
+    """Create interactive price chart with indicators"""
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.03,
+        subplot_titles=(f'{ticker} Price & Indicators', 'Volume'),
+        row_heights=[0.7, 0.3]
+    )
+
+    # Candlestick
+    fig.add_trace(
+        go.Candlestick(
+            x=df.index,
+            open=df['open'],
+            high=df['high'],
+            low=df['low'],
+            close=df['close'],
+            name='Price'
+        ),
+        row=1, col=1
+    )
+
+    # Bollinger Bands
+    fig.add_trace(
+        go.Scatter(x=df.index, y=df['bb_upper'], name='BB Upper',
+                  line=dict(color='rgba(250, 250, 250, 0.3)', width=1)),
+        row=1, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=df.index, y=df['bb_lower'], name='BB Lower',
+                  line=dict(color='rgba(250, 250, 250, 0.3)', width=1),
+                  fill='tonexty', fillcolor='rgba(250, 250, 250, 0.1)'),
+        row=1, col=1
+    )
+
+    # VWAP
+    fig.add_trace(
+        go.Scatter(x=df.index, y=df['vwap'], name='VWAP',
+                  line=dict(color='orange', width=2)),
+        row=1, col=1
+    )
+
+    # Moving Averages
+    fig.add_trace(
+        go.Scatter(x=df.index, y=df['MA5'], name='MA5',
+                  line=dict(color='cyan', width=1)),
+        row=1, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=df.index, y=df['MA20'], name='MA20',
+                  line=dict(color='magenta', width=1)),
+        row=1, col=1
+    )
+
+    # Volume
+    colors = ['red' if row['close'] < row['open'] else 'green' for _, row in df.iterrows()]
+    fig.add_trace(
+        go.Bar(x=df.index, y=df['volume'], name='Volume',
+               marker_color=colors),
+        row=2, col=1
+    )
+
+    fig.update_layout(
+        height=600,
+        template='plotly_dark',
+        showlegend=True,
+        xaxis_rangeslider_visible=False
+    )
+
+    return fig
+
+
+def main():
+    """Main dashboard"""
+
+    # Header
+    st.markdown('<h1 class="main-header">📈 PHASE 9 TRADING DASHBOARD</h1>', unsafe_allow_html=True)
+
+    # Sidebar
+    with st.sidebar:
+        st.header("⚙️ Controls")
+        st.write("**Live Trading System**")
+        st.write("Phase 9 Smart Execution")
+        st.divider()
+
+        if st.button("🔄 Refresh Signals", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+
+        st.divider()
+        st.write("**System Stats**")
+        st.metric("Win Rate", "58.95%")
+        st.metric("Sharpe Ratio", "4.64")
+        st.metric("Backtest Return", "+3.54%")
+
+    # Load positions
+    positions = load_positions()
+
+    # Portfolio Summary
+    st.header("💼 Portfolio Overview")
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    num_positions = positions['has_position'].sum()
+    total_pnl = 0.0
+
+    # Calculate total P&L
+    for _, pos in positions.iterrows():
+        if pos['has_position']:
+            signal = generate_signal(pos['ticker'])
+            if signal:
+                entry_price = float(pos['entry_price'])
+                current_price = signal['price']
+                pnl = current_price - entry_price
+                total_pnl += pnl
+
+    with col1:
+        st.metric("Active Positions", f"{num_positions}/4")
+    with col2:
+        st.metric("Total P&L", f"${total_pnl:.2f}",
+                 delta=f"{total_pnl/2500*100:.2f}%" if num_positions > 0 else None)
+    with col3:
+        st.metric("Capital Deployed", f"${num_positions * 2500:.0f}")
+    with col4:
+        st.metric("Cash Available", f"${(4-num_positions) * 2500:.0f}")
+
+    st.divider()
+
+    # Live Signals
+    st.header("🎯 Live Trading Signals")
+
+    # Generate signals for all stocks
+    signals = []
+    for ticker in TRADING_STOCKS:
+        with st.spinner(f"Loading {ticker}..."):
+            signal = generate_signal(ticker)
+            if signal:
+                signals.append(signal)
+
+    # Display each signal
+    for signal in signals:
+        ticker = signal['ticker']
+        pos = positions[positions['ticker'] == ticker].iloc[0]
+        has_position = pos['has_position']
+
+        # Determine card color
+        if signal['action'] == 'BUY':
+            card_class = 'buy-signal'
+            emoji = '🟢'
+        elif signal['action'] == 'SELL':
+            card_class = 'sell-signal'
+            emoji = '🔴'
+        else:
+            card_class = 'wait-signal'
+            emoji = '🟡'
+
+        # Create card
+        with st.container():
+            col1, col2, col3 = st.columns([2, 3, 2])
+
+            with col1:
+                st.subheader(f"{emoji} {ticker}")
+                st.metric("Current Price", f"${signal['price']:.2f}")
+
+                if has_position:
+                    entry_price = float(pos['entry_price'])
+                    pnl = signal['price'] - entry_price
+                    pnl_pct = (pnl / entry_price) * 100
+
+                    pnl_class = "profit-positive" if pnl > 0 else "profit-negative"
+                    st.markdown(f'<p class="{pnl_class}">P&L: ${pnl:.2f} ({pnl_pct:+.2f}%)</p>',
+                               unsafe_allow_html=True)
+                    st.caption(f"Entry: ${entry_price:.2f}")
+
+            with col2:
+                st.write("**Signal Analysis**")
+                col_a, col_b = st.columns(2)
+
+                with col_a:
+                    st.metric("Model Signal", signal['signal'])
+                    st.metric("Confidence", f"{signal['confidence']:.1%}")
+
+                with col_b:
+                    st.metric("Volatility (ATR)", f"{signal['atr_pct']:.2%}")
+                    vol_status = "✅ OK" if signal['volatility_ok'] else "⚠️ LOW"
+                    st.metric("Vol Check", vol_status)
+
+                # Action recommendation
+                action_text = signal['action']
+                if has_position:
+                    if signal['action'] == 'BUY':
+                        action_text = "🔵 HOLD POSITION"
+                    elif signal['action'] == 'SELL':
+                        action_text = "🔴 EXIT RECOMMENDED"
+                else:
+                    if signal['action'] == 'BUY':
+                        action_text = "🟢 ENTER LONG"
+                    elif signal['action'] == 'SELL':
+                        action_text = "⭕ STAY FLAT"
+
+                st.write(f"**Action:** {action_text}")
+
+            with col3:
+                st.write("**Position Control**")
+
+                if not has_position:
+                    if st.button(f"📈 ENTER POSITION", key=f"enter_{ticker}",
+                                use_container_width=True):
+                        enter_position(ticker, signal['price'])
+                else:
+                    if st.button(f"📉 EXIT POSITION", key=f"exit_{ticker}",
+                                use_container_width=True, type="primary"):
+                        exit_position(ticker)
+
+                # Show chart button
+                if st.button(f"📊 View Chart", key=f"chart_{ticker}",
+                            use_container_width=True):
+                    st.session_state[f'show_chart_{ticker}'] = True
+
+            # Show chart if requested
+            if st.session_state.get(f'show_chart_{ticker}', False):
+                with st.expander(f"📊 {ticker} Chart", expanded=True):
+                    fig = create_price_chart(signal['df'].tail(100), ticker)
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    if st.button(f"Close Chart", key=f"close_chart_{ticker}"):
+                        st.session_state[f'show_chart_{ticker}'] = False
+                        st.rerun()
+
+            st.divider()
+
+    # Footer
+    st.caption("⚠️ **Risk Warning:** Past performance does not guarantee future results. "
+              "This is for educational purposes. Trade at your own risk.")
+    st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+
+if __name__ == "__main__":
+    main()
