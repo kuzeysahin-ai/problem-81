@@ -2,4 +2,5 @@ ticker,has_position,entry_price,entry_time
 GOOG,False,0.0,
 XOM,False,0.0,
 NVDA,False,0.0,
-CAT,False,0.0,
+JPM,False,0.0,
+KO,False,0.0,

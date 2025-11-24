@@ -35,7 +35,7 @@ PORTFOLIO_FILE = PROJECT_ROOT / "data" / "portfolio_state.csv"
 TRADE_HISTORY_FILE = PROJECT_ROOT / "data" / "trade_history.csv"
 
 # Trading universe
-TRADING_STOCKS = ['GOOG', 'XOM', 'NVDA', 'CAT']
+TRADING_STOCKS = ['GOOG', 'XOM', 'NVDA', 'JPM', 'KO']
 
 # Constants
 MIN_ATR_THRESHOLD = 0.002
