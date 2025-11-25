@@ -1,8 +1,8 @@
 """
-PHASE 11: PROFESSIONAL TRADING DASHBOARD
-========================================
+PHASE 16: RISK MANAGEMENT ENGINE INTEGRATION
+=============================================
 
-Web-based Trading Control Panel with Streamlit
+Web-based Trading Control Panel with Advanced Risk Controls
 
 Features:
     - Live market signals with real-time updates
@@ -10,6 +10,10 @@ Features:
     - Portfolio P&L tracking
     - Interactive price charts
     - Dark mode professional UI
+    - PHASE 16: Dynamic Stop-Loss (ATR-based)
+    - PHASE 16: Panic Detection (VWAP + Volume)
+    - PHASE 16: Risk Zone Indicators (Safe/Warning/Critical)
+    - PHASE 13: Google Sheets Persistence (Cloud-first with local fallback)
 
 Usage:
     streamlit run dashboard.py
@@ -27,12 +31,15 @@ import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+# PHASE 13: Import Storage Manager
+from storage_manager import StorageManager
+
 # Configuration
 PROJECT_ROOT = Path(__file__).parent
 MODELS_DIR = PROJECT_ROOT / "models" / "intraday"
-POSITIONS_FILE = PROJECT_ROOT / "data" / "current_positions.csv"
-PORTFOLIO_FILE = PROJECT_ROOT / "data" / "portfolio_state.csv"
-TRADE_HISTORY_FILE = PROJECT_ROOT / "data" / "trade_history.csv"
+
+# PHASE 13: Initialize Storage Manager (replaces direct CSV access)
+storage = StorageManager()
 
 # Trading universe
 TRADING_STOCKS = ['GOOG', 'XOM', 'NVDA', 'JPM', 'KO']
@@ -47,6 +54,12 @@ EXCLUDE_COLS = [
     'hour', 'minute', 'day_of_week',
     'return', 'log_return', 'prev_close', 'tr'
 ]
+
+# PHASE 16: RISK MANAGEMENT PARAMETERS
+STOP_LOSS_ATR_MULTIPLIER = 2.0  # Stop = Entry - (2 * ATR)
+PANIC_VWAP_THRESHOLD = 0.98     # Price < VWAP * 0.98 = panic
+PANIC_VOLUME_MULTIPLIER = 2.0   # Volume > 2x average = panic
+STOP_WARNING_THRESHOLD = 0.01   # Warn when within 1% of stop
 
 # Page config
 st.set_page_config(
@@ -96,7 +109,131 @@ st.markdown("""
         font-size: 1.5rem;
     }
 </style>
+    .risk-safe {
+        background-color: #0d4d0d;
+        border-left: 5px solid #00ff00;
+        padding: 0.5rem;
+        border-radius: 5px;
+    }
+    .risk-warning {
+        background-color: #4d4d0d;
+        border-left: 5px solid #ffaa00;
+        padding: 0.5rem;
+        border-radius: 5px;
+    }
+    .risk-critical {
+        background-color: #4d0d0d;
+        border-left: 5px solid #ff0000;
+        padding: 0.5rem;
+        border-radius: 5px;
+        animation: blink 1s linear infinite;
+    }
+    @keyframes blink {
+        50% { opacity: 0.5; }
+    }
+</style>
 """, unsafe_allow_html=True)
+
+
+# ============================================================================
+# PHASE 16: RISK MANAGEMENT ENGINE
+# ============================================================================
+
+class RiskManager:
+    """
+    Advanced Risk Management Engine
+
+    Features:
+    - Dynamic ATR-based stop-loss (trailing)
+    - Panic detection (VWAP + Volume)
+    - Risk zone classification
+    """
+
+    @staticmethod
+    def calculate_dynamic_stop(entry_price, current_atr, highest_price_since_entry=None):
+        """
+        Calculate dynamic trailing stop-loss
+
+        Args:
+            entry_price: Entry price of position
+            current_atr: Current ATR value
+            highest_price_since_entry: Highest price since entry (for trailing)
+
+        Returns:
+            stop_price: Dynamic stop-loss level
+        """
+        # Base stop: Entry - (2 * ATR)
+        base_stop = entry_price - (STOP_LOSS_ATR_MULTIPLIER * current_atr)
+
+        # Trailing logic: If price went up, move stop up (never down)
+        if highest_price_since_entry and highest_price_since_entry > entry_price:
+            trailing_stop = highest_price_since_entry - (STOP_LOSS_ATR_MULTIPLIER * current_atr)
+            # Use whichever is higher (more protective)
+            stop_price = max(base_stop, trailing_stop)
+        else:
+            stop_price = base_stop
+
+        return stop_price
+
+    @staticmethod
+    def detect_panic(current_price, vwap, current_volume, avg_volume):
+        """
+        Detect panic selling conditions
+
+        Args:
+            current_price: Current market price
+            vwap: Volume-weighted average price
+            current_volume: Current bar volume
+            avg_volume: Average volume (e.g., 20-period MA)
+
+        Returns:
+            is_panic: Boolean
+            panic_reason: String description
+        """
+        # Condition 1: Price crash below VWAP
+        price_panic = current_price < (vwap * PANIC_VWAP_THRESHOLD)
+
+        # Condition 2: Volume spike
+        volume_panic = current_volume > (avg_volume * PANIC_VOLUME_MULTIPLIER)
+
+        # Both conditions must be true
+        is_panic = price_panic and volume_panic
+
+        if is_panic:
+            panic_reason = "CRITICAL: Price crash + Volume spike detected!"
+        elif price_panic:
+            panic_reason = "Price below VWAP threshold"
+        elif volume_panic:
+            panic_reason = "Volume spike detected"
+        else:
+            panic_reason = None
+
+        return is_panic, panic_reason
+
+    @staticmethod
+    def classify_risk_zone(current_price, stop_price, entry_price):
+        """
+        Classify current risk zone
+
+        Args:
+            current_price: Current market price
+            stop_price: Stop-loss level
+            entry_price: Entry price
+
+        Returns:
+            zone: 'SAFE', 'WARNING', or 'STOP_HIT'
+            emoji: Visual indicator
+            color_class: CSS class
+        """
+        # Calculate distance to stop (as percentage of entry)
+        distance_to_stop = (current_price - stop_price) / entry_price
+
+        if current_price <= stop_price:
+            return 'STOP_HIT', '🔴', 'risk-critical'
+        elif distance_to_stop <= STOP_WARNING_THRESHOLD:
+            return 'WARNING', '🟡', 'risk-warning'
+        else:
+            return 'SAFE', '🟢', 'risk-safe'
 
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
@@ -211,70 +348,12 @@ def prepare_features(df, model):
     return X
 
 
-def load_positions():
-    """Load current positions"""
-    if not POSITIONS_FILE.exists():
-        df = pd.DataFrame([
-            {'ticker': t, 'has_position': False, 'entry_price': 0.0, 'entry_time': ''}
-            for t in TRADING_STOCKS
-        ])
-        df.to_csv(POSITIONS_FILE, index=False)
-        return df
-    return pd.read_csv(POSITIONS_FILE)
-
-
-def save_positions(positions_df):
-    """Save positions"""
-    positions_df.to_csv(POSITIONS_FILE, index=False)
-
-
-def load_trade_history():
-    """Load trade history"""
-    if not TRADE_HISTORY_FILE.exists():
-        df = pd.DataFrame(columns=[
-            'ticker', 'entry_price', 'exit_price', 'pnl', 'pnl_pct',
-            'entry_time', 'exit_time', 'hold_duration'
-        ])
-        df.to_csv(TRADE_HISTORY_FILE, index=False)
-        return df
-    return pd.read_csv(TRADE_HISTORY_FILE)
-
-
-def log_trade(ticker, entry_price, entry_time, exit_price):
-    """Log completed trade to history"""
-    history = load_trade_history()
-
-    # Calculate metrics
-    pnl = exit_price - entry_price
-    pnl_pct = (pnl / entry_price) * 100
-    exit_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-    # Calculate hold duration
-    try:
-        entry_dt = pd.to_datetime(entry_time)
-        exit_dt = pd.to_datetime(exit_time)
-        hold_duration = str(exit_dt - entry_dt)
-    except:
-        hold_duration = 'N/A'
-
-    # Add new trade
-    new_trade = pd.DataFrame([{
-        'ticker': ticker,
-        'entry_price': entry_price,
-        'exit_price': exit_price,
-        'pnl': pnl,
-        'pnl_pct': pnl_pct,
-        'entry_time': entry_time,
-        'exit_time': exit_time,
-        'hold_duration': hold_duration
-    }])
-
-    history = pd.concat([history, new_trade], ignore_index=True)
-    history.to_csv(TRADE_HISTORY_FILE, index=False)
+# PHASE 13: Storage functions now use StorageManager
+# (Functions removed - using storage.load_positions(), storage.save_positions(), etc.)
 
 
 def generate_signal(ticker):
-    """Generate signal for ticker"""
+    """Generate signal for ticker with risk metrics"""
     df = fetch_live_data(ticker)
     if df is None or len(df) < 50:
         return None
@@ -286,6 +365,12 @@ def generate_signal(ticker):
     latest = df.iloc[-1]
     current_price = latest['close']
     atr_pct = latest['ATR_pct']
+    atr_value = latest['ATR']  # Absolute ATR value
+    vwap = latest['vwap']
+    current_volume = latest['volume']
+
+    # Calculate volume average (20-period)
+    volume_ma = df['volume'].rolling(20).mean().iloc[-1]
 
     X = prepare_features(df.tail(1), model)
     prediction = model.predict(X)[0]
@@ -308,6 +393,10 @@ def generate_signal(ticker):
         'confidence': confidence,
         'volatility_ok': volatility_ok,
         'atr_pct': atr_pct,
+        'atr_value': atr_value,
+        'vwap': vwap,
+        'current_volume': current_volume,
+        'volume_ma': volume_ma,
         'action': action,
         'last_update': df.index[-1],
         'df': df  # For charting
@@ -315,36 +404,20 @@ def generate_signal(ticker):
 
 
 def enter_position(ticker, price):
-    """Enter position (update CSV)"""
-    positions = load_positions()
-    idx = positions[positions['ticker'] == ticker].index[0]
-    positions.at[idx, 'has_position'] = True
-    positions.at[idx, 'entry_price'] = price
-    positions.at[idx, 'entry_time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    save_positions(positions)
+    """Enter position (PHASE 13: uses StorageManager)"""
+    storage.enter_position(ticker, price)
     st.success(f"✅ Entered {ticker} position at ${price:.2f}")
     st.rerun()
 
 
+def update_highest_price(ticker, current_price):
+    """Update highest price for trailing stop (PHASE 13: uses StorageManager)"""
+    storage.update_highest_price(ticker, current_price)
+
+
 def exit_position(ticker, exit_price):
-    """Exit position (update CSV and log trade)"""
-    positions = load_positions()
-    idx = positions[positions['ticker'] == ticker].index[0]
-
-    # Get position details before clearing
-    entry_price = float(positions.at[idx, 'entry_price'])
-    entry_time = positions.at[idx, 'entry_time']
-
-    # Log trade to history
-    log_trade(ticker, entry_price, entry_time, exit_price)
-
-    # Clear position
-    positions.at[idx, 'has_position'] = False
-    positions.at[idx, 'entry_price'] = 0.0
-    positions.at[idx, 'entry_time'] = ''
-    save_positions(positions)
-
-    pnl = exit_price - entry_price
+    """Exit position (PHASE 13: uses StorageManager)"""
+    pnl = storage.exit_position(ticker, exit_price)
     st.success(f"✅ Exited {ticker} position | P&L: ${pnl:.2f}")
     st.rerun()
 
@@ -472,6 +545,36 @@ def render_live_trading_tab(positions):
         pos = positions[positions['ticker'] == ticker].iloc[0]
         has_position = pos['has_position']
 
+        # PHASE 16: Pre-calculate risk metrics for active positions
+        risk_zone = None
+        risk_emoji = None
+        risk_class = None
+        is_panic = False
+        panic_reason = None
+        stop_price = None
+
+        if has_position:
+            entry_price = float(pos['entry_price'])
+            highest_price = float(pos['highest_price'])
+            current_price = signal['price']
+
+            # Update highest price if new high
+            update_highest_price(ticker, current_price)
+            if current_price > highest_price:
+                highest_price = current_price
+
+            # Calculate risk metrics
+            stop_price = RiskManager.calculate_dynamic_stop(
+                entry_price, signal['atr_value'], highest_price
+            )
+            risk_zone, risk_emoji, risk_class = RiskManager.classify_risk_zone(
+                current_price, stop_price, entry_price
+            )
+            is_panic, panic_reason = RiskManager.detect_panic(
+                current_price, signal['vwap'],
+                signal['current_volume'], signal['volume_ma']
+            )
+
         # Determine card color
         if signal['action'] == 'BUY':
             card_class = 'buy-signal'
@@ -493,13 +596,32 @@ def render_live_trading_tab(positions):
 
                 if has_position:
                     entry_price = float(pos['entry_price'])
-                    pnl = signal['price'] - entry_price
+                    current_price = signal['price']
+
+                    # Calculate P&L
+                    pnl = current_price - entry_price
                     pnl_pct = (pnl / entry_price) * 100
 
                     pnl_class = "profit-positive" if pnl > 0 else "profit-negative"
                     st.markdown(f'<p class="{pnl_class}">P&L: ${pnl:.2f} ({pnl_pct:+.2f}%)</p>',
                                unsafe_allow_html=True)
                     st.caption(f"Entry: ${entry_price:.2f}")
+
+                    # PHASE 16: Display Risk Metrics
+                    st.markdown(f"🛑 **Stop:** ${stop_price:.2f}")
+
+                    # Display risk zone with color
+                    st.markdown(
+                        f'<div class="{risk_class}">{risk_emoji} <b>{risk_zone}</b></div>',
+                        unsafe_allow_html=True
+                    )
+
+                    # Display panic warning if detected
+                    if is_panic:
+                        st.markdown(
+                            f'<div class="risk-critical">⚠️ <b>PANIC: {panic_reason}</b></div>',
+                            unsafe_allow_html=True
+                        )
 
             with col2:
                 st.write("**Signal Analysis**")
@@ -537,9 +659,33 @@ def render_live_trading_tab(positions):
                                 use_container_width=True):
                         enter_position(ticker, signal['price'])
                 else:
-                    if st.button(f"📉 EXIT POSITION", key=f"exit_{ticker}",
-                                use_container_width=True, type="primary"):
+                    # PHASE 16: Enhanced EXIT button based on risk
+                    exit_label = "📉 EXIT POSITION"
+                    exit_type = "primary"
+
+                    # Make button critical if stop hit or panic detected
+                    if risk_zone == 'STOP_HIT' or is_panic:
+                        exit_label = "🚨 EMERGENCY EXIT 🚨"
+                        exit_type = "primary"
+                    elif risk_zone == 'WARNING':
+                        exit_label = "⚠️ EXIT POSITION ⚠️"
+                        exit_type = "primary"
+
+                    if st.button(exit_label, key=f"exit_{ticker}",
+                                use_container_width=True, type=exit_type):
                         exit_position(ticker, signal['price'])
+
+                    # Display critical exit warning
+                    if risk_zone == 'STOP_HIT':
+                        st.markdown(
+                            '<div class="risk-critical" style="text-align: center; padding: 0.5rem; margin-top: 0.5rem;">🔴 <b>STOP HIT!</b></div>',
+                            unsafe_allow_html=True
+                        )
+                    elif is_panic:
+                        st.markdown(
+                            '<div class="risk-critical" style="text-align: center; padding: 0.5rem; margin-top: 0.5rem;">🔴 <b>PANIC EXIT!</b></div>',
+                            unsafe_allow_html=True
+                        )
 
                 # Show chart button
                 if st.button(f"📊 View Chart", key=f"chart_{ticker}",
@@ -560,11 +706,11 @@ def render_live_trading_tab(positions):
 
 
 def render_analytics_tab():
-    """Render Analytics tab with performance metrics"""
+    """Render Analytics tab with performance metrics (PHASE 13: uses StorageManager)"""
     st.header("📊 Performance Analytics")
 
     # Load trade history
-    history = load_trade_history()
+    history = storage.load_trade_history()
 
     if history.empty:
         st.info("📭 No trades yet. Start trading to see analytics!")
@@ -660,8 +806,17 @@ def main():
         st.metric("Sharpe Ratio", "4.64")
         st.metric("Backtest Return", "+3.54%")
 
-    # Load positions
-    positions = load_positions()
+        # PHASE 13: Storage status
+        st.divider()
+        st.write("**Storage Mode**")
+        storage_mode = storage.get_mode()
+        if storage_mode == "CLOUD":
+            st.success(f"☁️ Google Sheets")
+        else:
+            st.info(f"💾 Local CSV")
+
+    # PHASE 13: Load positions from StorageManager
+    positions = storage.load_positions()
 
     # Create tabs
     tab1, tab2 = st.tabs(["📉 Live Trading", "📊 Analytics"])

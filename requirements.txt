@@ -23,3 +23,7 @@ streamlit>=1.28.0
 # Utilities
 python-dateutil>=2.8.0
 pytz>=2023.3
+
+# PHASE 13: Google Sheets Persistence Layer
+gspread>=5.12.0
+oauth2client>=4.1.3
