@@ -1,6 +1,6 @@
 """
-PHASE 16: RISK MANAGEMENT ENGINE INTEGRATION
-=============================================
+PHASE 19: SMART DATA FETCHING OPTIMIZATION
+============================================
 
 Web-based Trading Control Panel with Advanced Risk Controls
 
@@ -14,6 +14,8 @@ Features:
     - PHASE 16: Panic Detection (VWAP + Volume)
     - PHASE 16: Risk Zone Indicators (Safe/Warning/Critical)
     - PHASE 13: Google Sheets Persistence (Cloud-first with local fallback)
+    - PHASE 18: Kelly Criterion Position Sizing (Fractional Kelly 0.5x)
+    - PHASE 19: Smart Data Fetching (3-min cache, retry logic, stale data fallback)
 
 Usage:
     streamlit run dashboard.py
@@ -30,6 +32,7 @@ from datetime import datetime, timedelta
 import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import time
 
 # PHASE 13: Import Storage Manager
 from storage_manager import StorageManager
@@ -317,7 +320,7 @@ class RiskManager:
             return 'SAFE', '🟢', 'risk-safe'
 
 
-@st.cache_data(ttl=300)  # Cache for 5 minutes
+@st.cache_data(ttl=180)  # Cache for 3 minutes (PHASE 19: Smart caching)
 def calculate_vwap(df):
     """Calculate VWAP"""
     df['vwap'] = (df['close'] * df['volume']).cumsum() / df['volume'].cumsum()
@@ -325,7 +328,7 @@ def calculate_vwap(df):
     return df
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=180)  # Cache for 3 minutes (PHASE 19: Smart caching)
 def add_intraday_features(df):
     """Add all intraday features"""
     df['return'] = df['close'].pct_change()
@@ -386,22 +389,66 @@ def add_intraday_features(df):
     return df
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=180)  # Cache for 3 minutes (optimized from 5 minutes)
 def fetch_live_data(ticker, period='60d', interval='1h'):
-    """Fetch live data"""
-    try:
-        stock = yf.Ticker(ticker)
-        df = stock.history(period=period, interval=interval)
-        if df.empty:
-            return None
-        df.columns = df.columns.str.lower().str.replace(' ', '_')
-        df.index = pd.to_datetime(df.index)
-        df = add_intraday_features(df)
-        df = df.dropna()
-        return df
-    except Exception as e:
-        st.error(f"Error fetching {ticker}: {e}")
-        return None
+    """
+    Fetch live data with retry logic
+
+    PHASE 19: Smart Data Fetching
+    - 3-minute cache (was 5 minutes)
+    - 3 retry attempts with 1-second backoff
+    - Graceful degradation: returns stale data if available
+    """
+    MAX_RETRIES = 3
+    RETRY_DELAY = 1  # seconds
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            stock = yf.Ticker(ticker)
+            df = stock.history(period=period, interval=interval)
+
+            if df.empty:
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY)
+                    continue
+                return None
+
+            # Success: Process and cache the data
+            df.columns = df.columns.str.lower().str.replace(' ', '_')
+            df.index = pd.to_datetime(df.index)
+            df = add_intraday_features(df)
+            df = df.dropna()
+
+            # Store successful fetch timestamp and backup data
+            if 'data_fetch_times' not in st.session_state:
+                st.session_state.data_fetch_times = {}
+            if 'stale_data' not in st.session_state:
+                st.session_state.stale_data = {}
+
+            st.session_state.data_fetch_times[ticker] = datetime.now()
+            st.session_state.stale_data[ticker] = df.copy()  # Save as backup
+
+            return df
+
+        except Exception as e:
+            if attempt < MAX_RETRIES - 1:
+                # Not the last attempt - retry after delay
+                time.sleep(RETRY_DELAY)
+                continue
+            else:
+                # Last attempt failed - check for stale data
+                if 'stale_data' not in st.session_state:
+                    st.session_state.stale_data = {}
+
+                # Try to return stale data if available
+                if ticker in st.session_state.stale_data:
+                    st.warning(f"⚠️ Using stale data for {ticker} (fetch failed: {str(e)[:50]})")
+                    return st.session_state.stale_data[ticker]
+                else:
+                    st.error(f"❌ Error fetching {ticker}: {e}")
+                    return None
+
+    return None
 
 
 @st.cache_resource
@@ -673,6 +720,14 @@ def render_live_trading_tab(positions, account_capital):
 
             with col1:
                 st.subheader(f"{emoji} {ticker}")
+
+                # PHASE 19: Show data freshness indicator
+                if 'data_fetch_times' in st.session_state and ticker in st.session_state.data_fetch_times:
+                    fetch_time = st.session_state.data_fetch_times[ticker]
+                    age_seconds = (datetime.now() - fetch_time).total_seconds()
+                    if age_seconds > 180:  # Older than cache TTL
+                        st.caption(f"⚠️ Data {age_seconds/60:.1f}m old")
+
                 st.metric("Current Price", f"${signal['price']:.2f}")
 
                 if has_position:
@@ -895,9 +950,24 @@ def main():
         st.write("Phase 9 Smart Execution")
         st.divider()
 
-        if st.button("🔄 Refresh Signals", use_container_width=True):
+        # PHASE 19: Enhanced Refresh with data freshness indicator
+        if st.button("🔄 Refresh Signals", use_container_width=True, help="Force refresh all market data (clears 3-min cache)"):
             st.cache_data.clear()
+            # Clear stale data tracking
+            if 'stale_data' in st.session_state:
+                del st.session_state.stale_data
+            if 'data_fetch_times' in st.session_state:
+                del st.session_state.data_fetch_times
             st.rerun()
+
+        # Show data freshness
+        if 'data_fetch_times' in st.session_state and st.session_state.data_fetch_times:
+            latest_fetch = max(st.session_state.data_fetch_times.values())
+            time_diff = (datetime.now() - latest_fetch).total_seconds()
+            if time_diff < 60:
+                st.caption(f"📊 Data: {time_diff:.0f}s ago")
+            else:
+                st.caption(f"📊 Data: {time_diff/60:.1f}m ago")
 
         # PHASE 18: Account Capital Setting
         st.divider()
