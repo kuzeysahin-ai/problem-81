@@ -108,7 +108,6 @@ st.markdown("""
         font-weight: bold;
         font-size: 1.5rem;
     }
-</style>
     .risk-safe {
         background-color: #0d4d0d;
         border-left: 5px solid #00ff00;
@@ -814,6 +813,23 @@ def main():
             st.success(f"☁️ Google Sheets")
         else:
             st.info(f"💾 Local CSV")
+
+            # Show error if Google Sheets connection failed
+            error_msg = storage.get_connection_error()
+            if error_msg:
+                st.error(f"⚠️ **Google Sheets Error:**\n\n{error_msg}")
+                with st.expander("🔧 Troubleshooting Tips"):
+                    st.markdown("""
+                    **Common Issues:**
+
+                    1. **Missing secrets**: Check `.streamlit/secrets.toml` exists
+                    2. **Wrong format**: Verify JSON structure matches GCP service account
+                    3. **Missing libraries**: Run `pip install gspread oauth2client`
+                    4. **API not enabled**: Enable Google Sheets API in GCP Console
+                    5. **Permission denied**: Share spreadsheet with service account email
+
+                    See `GOOGLE_SHEETS_SETUP.md` for detailed setup guide.
+                    """)
 
     # PHASE 13: Load positions from StorageManager
     positions = storage.load_positions()
