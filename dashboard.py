@@ -135,6 +135,88 @@ st.markdown("""
 
 
 # ============================================================================
+# PHASE 18: KELLY POSITION SIZER
+# ============================================================================
+
+class KellySizer:
+    """
+    Kelly Criterion Position Sizing Engine
+
+    Dynamically calculates optimal position size based on:
+    - Model confidence (win probability)
+    - Risk/Reward ratio
+    - Account size
+
+    Uses Fractional Kelly (0.5x) for safety
+    """
+
+    @staticmethod
+    def calculate_position_size(win_rate, account_size, risk_reward_ratio=1.5,
+                                max_position_pct=0.30, kelly_fraction=0.5):
+        """
+        Calculate optimal position size using Kelly Criterion
+
+        Args:
+            win_rate: Probability of winning (0.0 to 1.0)
+            account_size: Total account capital
+            risk_reward_ratio: Average Win / Average Loss (default 1.5)
+            max_position_pct: Maximum % of account per position (default 0.30)
+            kelly_fraction: Fraction of Kelly to use (default 0.5 = Half Kelly)
+
+        Returns:
+            dict with:
+                - kelly_pct: Raw Kelly percentage
+                - safe_pct: Fractional Kelly percentage
+                - position_size: Dollar amount to invest
+                - share_count: Number of shares (if current_price provided)
+                - recommendation: Text recommendation
+        """
+        # Kelly Formula: f = (p * r - q) / r
+        # Where: p = win_rate, q = (1 - win_rate), r = risk_reward_ratio
+
+        q = 1 - win_rate
+        kelly_pct = (win_rate - (q / risk_reward_ratio))
+
+        # Apply Fractional Kelly (reduce aggressiveness)
+        safe_pct = kelly_pct * kelly_fraction
+
+        # Apply hard cap
+        safe_pct = min(safe_pct, max_position_pct)
+
+        # No negative positions
+        safe_pct = max(safe_pct, 0.0)
+
+        # Calculate dollar amount
+        position_size = account_size * safe_pct
+
+        # Recommendation text
+        if safe_pct == 0:
+            recommendation = "🚫 NO POSITION - Edge too small"
+        elif safe_pct < 0.05:
+            recommendation = "⚠️ MINIMAL - Low confidence"
+        elif safe_pct < 0.15:
+            recommendation = "✅ MODERATE - Standard size"
+        elif safe_pct < 0.25:
+            recommendation = "🔥 LARGE - High confidence"
+        else:
+            recommendation = "🚀 MAX SIZE - Very high confidence (capped at 30%)"
+
+        return {
+            'kelly_pct': kelly_pct,
+            'safe_pct': safe_pct,
+            'position_size': position_size,
+            'recommendation': recommendation
+        }
+
+    @staticmethod
+    def calculate_share_count(position_size, current_price):
+        """Calculate number of shares for given position size"""
+        if current_price <= 0:
+            return 0
+        return int(position_size / current_price)
+
+
+# ============================================================================
 # PHASE 16: RISK MANAGEMENT ENGINE
 # ============================================================================
 
@@ -494,8 +576,8 @@ def create_price_chart(df, ticker):
     return fig
 
 
-def render_live_trading_tab(positions):
-    """Render Live Trading tab content"""
+def render_live_trading_tab(positions, account_capital):
+    """Render Live Trading tab content (PHASE 18: with Kelly sizing)"""
 
     # Portfolio Summary
     st.header("💼 Portfolio Overview")
@@ -654,6 +736,24 @@ def render_live_trading_tab(positions):
                 st.write("**Position Control**")
 
                 if not has_position:
+                    # PHASE 18: Kelly Position Calculator
+                    kelly_result = KellySizer.calculate_position_size(
+                        win_rate=signal['confidence'],
+                        account_size=account_capital
+                    )
+
+                    # Display Kelly calculation
+                    st.info(f"""
+                    **📊 Kelly Position Sizer**
+
+                    Model Confidence: **{signal['confidence']:.1%}**
+                    Kelly Allocation: **{kelly_result['safe_pct']:.1%}**
+                    Recommended: **${kelly_result['position_size']:,.0f}**
+                    Shares: **{KellySizer.calculate_share_count(kelly_result['position_size'], signal['price'])}**
+
+                    {kelly_result['recommendation']}
+                    """)
+
                     if st.button(f"📈 ENTER POSITION", key=f"enter_{ticker}",
                                 use_container_width=True):
                         enter_position(ticker, signal['price'])
@@ -799,6 +899,27 @@ def main():
             st.cache_data.clear()
             st.rerun()
 
+        # PHASE 18: Account Capital Setting
+        st.divider()
+        st.write("**💰 Account Capital**")
+        if 'account_capital' not in st.session_state:
+            st.session_state.account_capital = 10000.0
+
+        account_capital = st.number_input(
+            "Total Capital ($)",
+            min_value=1000.0,
+            max_value=1000000.0,
+            value=st.session_state.account_capital,
+            step=1000.0,
+            format="%.2f",
+            help="Total account size for Kelly position sizing"
+        )
+        st.session_state.account_capital = account_capital
+
+        # Display available capital per position
+        max_per_position = account_capital * 0.30
+        st.caption(f"Max per position: ${max_per_position:,.0f} (30%)")
+
         st.divider()
         st.write("**System Stats**")
         st.metric("Win Rate", "58.95%")
@@ -838,7 +959,8 @@ def main():
     tab1, tab2 = st.tabs(["📉 Live Trading", "📊 Analytics"])
 
     with tab1:
-        render_live_trading_tab(positions)
+        # PHASE 18: Pass account capital for Kelly sizing
+        render_live_trading_tab(positions, account_capital)
 
     with tab2:
         render_analytics_tab()
