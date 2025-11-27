@@ -960,14 +960,63 @@ def main():
                 del st.session_state.data_fetch_times
             st.rerun()
 
-        # Show data freshness
+        # PHASE 19: Detailed Data Freshness Indicator
+        st.divider()
         if 'data_fetch_times' in st.session_state and st.session_state.data_fetch_times:
+            # Get latest fetch time
             latest_fetch = max(st.session_state.data_fetch_times.values())
-            time_diff = (datetime.now() - latest_fetch).total_seconds()
-            if time_diff < 60:
-                st.caption(f"📊 Data: {time_diff:.0f}s ago")
+
+            # Convert to NY time (US/Eastern)
+            import pytz
+            ny_tz = pytz.timezone('US/Eastern')
+
+            # Ensure latest_fetch is timezone-aware
+            if latest_fetch.tzinfo is None:
+                # Make it timezone-aware (assume local time)
+                local_tz = pytz.timezone('UTC')
+                latest_fetch = local_tz.localize(latest_fetch)
+
+            ny_time = latest_fetch.astimezone(ny_tz)
+
+            # Calculate data age (use timezone-aware datetime)
+            current_time = datetime.now(pytz.UTC)
+            if latest_fetch.tzinfo is None:
+                latest_fetch = pytz.UTC.localize(latest_fetch)
+
+            time_diff_seconds = (current_time - latest_fetch).total_seconds()
+            time_diff_minutes = time_diff_seconds / 60
+
+            # Format last update time
+            last_update_str = ny_time.strftime('%H:%M:%S')
+
+            # Format data age
+            if time_diff_seconds < 60:
+                data_age_str = f"{time_diff_seconds:.0f}s ago"
             else:
-                st.caption(f"📊 Data: {time_diff/60:.1f}m ago")
+                data_age_str = f"{time_diff_minutes:.1f}m ago"
+
+            # Display with color coding
+            st.write("**📡 Data Freshness**")
+
+            # Last update time (always shown)
+            st.caption(f"🕒 Last Update: **{last_update_str}** (NY)")
+
+            # Data age with color coding
+            if time_diff_minutes > 15:
+                # STALE: Red warning
+                st.error(f"⚠️ Data Age: **{data_age_str}** - STALE DATA!")
+                st.caption("⚠️ Data is over 15 minutes old. Click Refresh!")
+            elif time_diff_minutes > 5:
+                # AGING: Yellow warning
+                st.warning(f"📊 Data Age: **{data_age_str}** - Getting old")
+                st.caption("Consider refreshing for latest data")
+            else:
+                # FRESH: Green checkmark
+                st.success(f"✅ Data Age: **{data_age_str}** - Fresh")
+        else:
+            # No data fetched yet
+            st.write("**📡 Data Freshness**")
+            st.info("⏳ No data loaded yet. Click signals to fetch.")
 
         # PHASE 18: Account Capital Setting
         st.divider()
