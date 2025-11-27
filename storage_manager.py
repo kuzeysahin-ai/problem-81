@@ -350,6 +350,11 @@ class StorageManager:
             df['highest_price'] = 0.0
             df.to_csv(self.positions_file, index=False)
 
+        # CRITICAL FIX: Ensure has_position is boolean type
+        # Pandas may read it as string or object type from CSV
+        if df['has_position'].dtype != bool:
+            df['has_position'] = df['has_position'].astype(bool)
+
         return df
 
     def _save_positions_local(self, positions_df):
@@ -386,10 +391,27 @@ class StorageManager:
             data = worksheet.get_all_records()
             df = pd.DataFrame(data)
 
-            # Convert string boolean to actual boolean
-            df['has_position'] = df['has_position'].map({
-                'True': True, 'False': False, True: True, False: False
-            })
+            # CRITICAL FIX: Convert has_position to boolean safely
+            # Handle multiple possible formats: 'True', 'False', 'nan', True, False, NaN
+            def safe_bool_convert(val):
+                """Safely convert various formats to boolean"""
+                if pd.isna(val):
+                    return False
+                if isinstance(val, bool):
+                    return val
+                if isinstance(val, str):
+                    val_lower = val.lower().strip()
+                    if val_lower in ('true', '1', 'yes'):
+                        return True
+                    elif val_lower in ('false', '0', 'no', 'nan', ''):
+                        return False
+                # Fallback: try numeric conversion
+                try:
+                    return bool(float(val))
+                except:
+                    return False
+
+            df['has_position'] = df['has_position'].apply(safe_bool_convert)
 
             # Convert string numbers to float
             df['entry_price'] = df['entry_price'].astype(float)
@@ -415,8 +437,17 @@ class StorageManager:
                 # Update ticker (A column)
                 worksheet.update_cell(i, 1, str(row['ticker']))
 
-                # Update has_position (B column)
-                worksheet.update_cell(i, 2, str(row['has_position']))
+                # Update has_position (B column) - CRITICAL: Ensure proper boolean format
+                # Convert boolean to string explicitly to avoid pandas/gspread conversion issues
+                has_pos = row['has_position']
+                if pd.isna(has_pos):
+                    has_pos_str = 'False'
+                elif isinstance(has_pos, bool):
+                    has_pos_str = 'True' if has_pos else 'False'
+                else:
+                    # Fallback: try to interpret as boolean
+                    has_pos_str = 'True' if has_pos else 'False'
+                worksheet.update_cell(i, 2, has_pos_str)
 
                 # Update entry_price (C column) - CRITICAL: Send as number, not string
                 entry_price_val = float(row['entry_price'])
