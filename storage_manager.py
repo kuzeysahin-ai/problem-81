@@ -47,6 +47,7 @@ class StorageManager:
         self.mode = None
         self.gspread_client = None
         self.spreadsheet = None
+        self.connection_error = None  # Store error message for debugging
 
         # Local CSV paths (fallback)
         self.project_root = Path(__file__).parent
@@ -65,12 +66,15 @@ class StorageManager:
             # Try to initialize Google Sheets
             if self._init_google_sheets():
                 self.mode = "CLOUD"
+                self.connection_error = None
                 print("✅ Storage Mode: GOOGLE SHEETS (Cloud)")
             else:
                 self.mode = "FALLBACK"
+                # connection_error already set by _init_google_sheets
                 print("⚠️  Storage Mode: LOCAL CSV (Fallback)")
         except Exception as e:
             self.mode = "FALLBACK"
+            self.connection_error = f"Initialization error: {type(e).__name__}: {str(e)}"
             print(f"⚠️  Storage Mode: LOCAL CSV (Fallback) - {str(e)}")
 
     def _init_google_sheets(self):
@@ -99,9 +103,11 @@ class StorageManager:
 
             # Check if secrets exist
             if "gcp_service_account" not in st.secrets:
+                self.connection_error = "Missing 'gcp_service_account' in Streamlit secrets"
                 return False
 
             if "sheets" not in st.secrets:
+                self.connection_error = "Missing 'sheets' section in Streamlit secrets"
                 return False
 
             # Setup credentials
@@ -125,11 +131,19 @@ class StorageManager:
 
             return True
 
-        except ImportError:
+        except ImportError as e:
             # gspread not installed
+            self.connection_error = f"Missing library: {str(e)}. Run 'pip install gspread oauth2client'"
+            return False
+        except KeyError as e:
+            # Missing key in secrets
+            self.connection_error = f"Missing secret key: {str(e)}"
             return False
         except Exception as e:
-            print(f"Google Sheets init failed: {e}")
+            # Other errors (API errors, auth errors, etc.)
+            error_type = type(e).__name__
+            self.connection_error = f"{error_type}: {str(e)}"
+            print(f"Google Sheets init failed: {error_type}: {e}")
             return False
 
     def _ensure_worksheets_exist(self):
@@ -393,13 +407,27 @@ class StorageManager:
         try:
             worksheet = self.spreadsheet.worksheet('positions')
 
-            # Convert DataFrame to list of lists
-            df = positions_df.copy()
-            df['has_position'] = df['has_position'].astype(str)
+            # CRITICAL FIX: Update each cell individually to avoid locale issues
+            # Google Sheets with Turkish locale has decimal separator problems
+            # Solution: Update cells one-by-one, ensuring float values are preserved
 
-            # Update sheet (skip header row)
-            data = df.values.tolist()
-            worksheet.update('A2:E6', data)  # Big 5 stocks = 5 rows
+            for i, (idx, row) in enumerate(positions_df.iterrows(), start=2):  # Start from row 2 (skip header)
+                # Update ticker (A column)
+                worksheet.update_cell(i, 1, str(row['ticker']))
+
+                # Update has_position (B column)
+                worksheet.update_cell(i, 2, str(row['has_position']))
+
+                # Update entry_price (C column) - CRITICAL: Send as number, not string
+                entry_price_val = float(row['entry_price'])
+                worksheet.update_cell(i, 3, entry_price_val)
+
+                # Update entry_time (D column)
+                worksheet.update_cell(i, 4, str(row['entry_time']))
+
+                # Update highest_price (E column) - CRITICAL: Send as number, not string
+                highest_price_val = float(row['highest_price'])
+                worksheet.update_cell(i, 5, highest_price_val)
 
         except Exception as e:
             print(f"Error saving to Google Sheets: {e}")
@@ -457,6 +485,10 @@ class StorageManager:
     def get_mode(self):
         """Get current storage mode"""
         return self.mode
+
+    def get_connection_error(self):
+        """Get connection error message (None if no error)"""
+        return self.connection_error
 
     def test_connection(self):
         """Test storage connection"""
